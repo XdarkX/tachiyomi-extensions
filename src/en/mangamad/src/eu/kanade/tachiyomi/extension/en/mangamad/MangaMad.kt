@@ -1,8 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.mangamad
 
 import android.annotation.SuppressLint
-import android.app.Application
-import android.content.SharedPreferences
 import android.net.Uri
 import eu.kanade.tachiyomi.annotations.Nsfw
 import eu.kanade.tachiyomi.network.GET
@@ -19,8 +17,6 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -37,14 +33,13 @@ class MangaMad : ParsedHttpSource() {
     override val name = "MangaMad"
     override val baseUrl = "https://mangamad.com"
 
-    private val nextPageSelector = ".paginator:not(.order) > a:last-child"
-    private val json: Json by injectLazy()
-    private val dateFormat = SimpleDateFormat("MMM d, yyyy", Locale.ENGLISH)
+    private val nextPageSelector = ".paginator:not(.order) > a:last-child[href]"
+    private val dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale.ENGLISH)
     private val dateFormatTimeOnly = SimpleDateFormat("HH:mm a", Locale.ENGLISH)
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/popular?page=$page")
 
-    override fun popularMangaSelector() = searchMangaSelector()
+    override fun popularMangaSelector() = ".book-item"
 
     override fun popularMangaFromElement(element: Element) = mangaFromElement(element)
 
@@ -74,7 +69,10 @@ class MangaMad : ParsedHttpSource() {
         return GET(uri.toString())
     }
 
-    override fun searchMangaSelector() = ".book-item"
+    override fun searchMangaSelector(): String {
+        // search results are contained in the second div tag
+        return "div.section.box:eq(2) .book-item"
+    }
 
     override fun searchMangaFromElement(element: Element) = mangaFromElement(element)
 
@@ -98,14 +96,12 @@ class MangaMad : ParsedHttpSource() {
         document.select("div.detail div.meta.box p").forEach {
             when (it.text().trim().toLowerCase().substringBefore(" :")) {
                 "authors" -> {
-                    author = it.getElementsByTag("a").joinToString(transform = Element::text)
-                }
-                "artist(s)" -> {
-                    artist = it.getElementsByTag("a").joinToString(transform = Element::text)
+                    author = it.getElementsByTag("a")
+                        .joinToString { it.text().substringBefore(",").trim() }
                 }
                 "genres" -> {
-                    genre = it.getElementsByTag("a").map { it.text().substringBefore(",").trim() }
-                        .joinToString()
+                    genre = it.getElementsByTag("a")
+                        .joinToString { it.text().substringBefore(",").trim() }
                 }
                 "status" -> {
                     status = when (it.getElementsByTag("td").text().trim().toLowerCase()) {
@@ -121,11 +117,12 @@ class MangaMad : ParsedHttpSource() {
 
         // add alternative name to manga description
         val altName = "Alternative Name: "
-        document.select(".attr > tbody > tr:contains(Alter) td").firstOrNull()?.ownText()?.let {
-            if (it.isBlank().not()) {
+        document.select("div.detail div.name.box h2").firstOrNull()?.ownText()?.let {
+            val names = it.split(";").map { it.trim() }
+            if (names.isNotEmpty()) {
                 description = when {
-                    description.isNullOrBlank() -> altName + it
-                    else -> description + "\n\n$altName" + it
+                    description.isNullOrBlank() -> altName + names.joinToString()
+                    else -> description + "\n\n$altName" + names.joinToString()
                 }
             }
         }
@@ -142,6 +139,13 @@ class MangaMad : ParsedHttpSource() {
 
     override fun chapterListSelector() = ".chapter-list li"
 
+    override fun chapterListParse(response: Response): List<SChapter> {
+        return response.asJsoup()
+            .select(chapterListSelector())
+            .map(::chapterFromElement)
+            .sortedBy { it.chapter_number }
+    }
+
     override fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
         name = element.selectFirst(".chapter-title").text()
         setUrlWithoutDomain(element.selectFirst("a").attr("href"))
@@ -157,7 +161,10 @@ class MangaMad : ParsedHttpSource() {
             ?.groupValues
             ?.getOrNull(1)
             ?.toFloatOrNull()
-            ?: 0f
+            ?: Regex("""chapter.*?(\d+-?\d?)""").find(name.toLowerCase())
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toFloatOrNull() ?: 0f
         date_upload = parseDate(element.selectFirst(".chapter-update").text().trim())
     }
 
@@ -239,254 +246,158 @@ class MangaMad : ParsedHttpSource() {
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException("Not used")
 
     override fun getFilterList() = FilterList(
-        AuthorArtistText(),
-        SearchTypeFilter("Title query", "name-match"),
-        SearchTypeFilter("Author/Artist query", "autart-match"),
         SortFilter(),
-        GenreGroup(),
-        GenreInclusionFilter(),
-        ChapterCountFilter(),
+        GenreFilterBig(),
         StatusFilter(),
-        RatingFilter(),
-        TypeFilter(),
-        YearFilter()
     )
 
     private class SearchTypeFilter(name: String, val uriParam: String) :
-        Filter.Select<String>(name, STATE_MAP), UriFilter {
+        Filter.Text(name), UriFilter {
         override fun addToUri(uri: Uri.Builder) {
-            if (STATE_MAP[state] != "contain") {
-                uri.appendQueryParameter(uriParam, STATE_MAP[state])
-            }
-        }
-
-        companion object {
-            private val STATE_MAP = arrayOf("contain", "begin", "end")
+            uri.appendQueryParameter(uriParam, state)
         }
     }
 
-    private class AuthorArtistText : Filter.Text("Author/Artist"), UriFilter {
-        override fun addToUri(uri: Uri.Builder) {
-            if (state.isNotEmpty()) {
-                uri.appendQueryParameter("autart", state)
-            }
+    private data class GenreFilter(val uriParam: String, val displayName: String) {
+        fun toPair(): Pair<String, String> {
+            return Pair(uriParam, displayName)
         }
     }
 
-    private class GenreFilter(val uriParam: String, displayName: String) :
-        Filter.TriState(displayName)
-
-    private class GenreGroup :
-        Filter.Group<GenreFilter>(
-            "Genres",
-            listOf(
-                GenreFilter("4-koma", "4 koma"),
-                GenreFilter("action", "Action"),
-                GenreFilter("adaptation", "Adaptation"),
-                GenreFilter("adult", "Adult"),
-                GenreFilter("adventure", "Adventure"),
-                GenreFilter("aliens", "Aliens"),
-                GenreFilter("animals", "Animals"),
-                GenreFilter("anthology", "Anthology"),
-                GenreFilter("award-winning", "Award winning"),
-                GenreFilter("comedy", "Comedy"),
-                GenreFilter("cooking", "Cooking"),
-                GenreFilter("crime", "Crime"),
-                GenreFilter("crossdressing", "Crossdressing"),
-                GenreFilter("delinquents", "Delinquents"),
-                GenreFilter("demons", "Demons"),
-                GenreFilter("doujinshi", "Doujinshi"),
-                GenreFilter("drama", "Drama"),
-                GenreFilter("ecchi", "Ecchi"),
-                GenreFilter("fan-colored", "Fan colored"),
-                GenreFilter("fantasy", "Fantasy"),
-                GenreFilter("food", "Food"),
-                GenreFilter("full-color", "Full color"),
-                GenreFilter("game", "Game"),
-                GenreFilter("gender-bender", "Gender bender"),
-                GenreFilter("genderswap", "Genderswap"),
-                GenreFilter("ghosts", "Ghosts"),
-                GenreFilter("gore", "Gore"),
-                GenreFilter("gossip", "Gossip"),
-                GenreFilter("gyaru", "Gyaru"),
-                GenreFilter("harem", "Harem"),
-                GenreFilter("historical", "Historical"),
-                GenreFilter("horror", "Horror"),
-                GenreFilter("incest", "Incest"),
-                GenreFilter("isekai", "Isekai"),
-                GenreFilter("josei", "Josei"),
-                GenreFilter("kids", "Kids"),
-                GenreFilter("loli", "Loli"),
-                GenreFilter("lolicon", "Lolicon"),
-                GenreFilter("long-strip", "Long strip"),
-                GenreFilter("mafia", "Mafia"),
-                GenreFilter("magic", "Magic"),
-                GenreFilter("magical-girls", "Magical girls"),
-                GenreFilter("manhwa", "Manhwa"),
-                GenreFilter("martial-arts", "Martial arts"),
-                GenreFilter("mature", "Mature"),
-                GenreFilter("mecha", "Mecha"),
-                GenreFilter("medical", "Medical"),
-                GenreFilter("military", "Military"),
-                GenreFilter("monster-girls", "Monster girls"),
-                GenreFilter("monsters", "Monsters"),
-                GenreFilter("music", "Music"),
-                GenreFilter("mystery", "Mystery"),
-                GenreFilter("ninja", "Ninja"),
-                GenreFilter("office-workers", "Office workers"),
-                GenreFilter("official-colored", "Official colored"),
-                GenreFilter("one-shot", "One shot"),
-                GenreFilter("parody", "Parody"),
-                GenreFilter("philosophical", "Philosophical"),
-                GenreFilter("police", "Police"),
-                GenreFilter("post-apocalyptic", "Post apocalyptic"),
-                GenreFilter("psychological", "Psychological"),
-                GenreFilter("reincarnation", "Reincarnation"),
-                GenreFilter("reverse-harem", "Reverse harem"),
-                GenreFilter("romance", "Romance"),
-                GenreFilter("samurai", "Samurai"),
-                GenreFilter("school-life", "School life"),
-                GenreFilter("sci-fi", "Sci fi"),
-                GenreFilter("seinen", "Seinen"),
-                GenreFilter("shota", "Shota"),
-                GenreFilter("shotacon", "Shotacon"),
-                GenreFilter("shoujo", "Shoujo"),
-                GenreFilter("shoujo-ai", "Shoujo ai"),
-                GenreFilter("shounen", "Shounen"),
-                GenreFilter("shounen-ai", "Shounen ai"),
-                GenreFilter("slice-of-life", "Slice of life"),
-                GenreFilter("smut", "Smut"),
-                GenreFilter("space", "Space"),
-                GenreFilter("sports", "Sports"),
-                GenreFilter("super-power", "Super power"),
-                GenreFilter("superhero", "Superhero"),
-                GenreFilter("supernatural", "Supernatural"),
-                GenreFilter("survival", "Survival"),
-                GenreFilter("suspense", "Suspense"),
-                GenreFilter("thriller", "Thriller"),
-                GenreFilter("time-travel", "Time travel"),
-                GenreFilter("toomics", "Toomics"),
-                GenreFilter("traditional-games", "Traditional games"),
-                GenreFilter("tragedy", "Tragedy"),
-                GenreFilter("user-created", "User created"),
-                GenreFilter("vampire", "Vampire"),
-                GenreFilter("vampires", "Vampires"),
-                GenreFilter("video-games", "Video games"),
-                GenreFilter("virtual-reality", "Virtual reality"),
-                GenreFilter("web-comic", "Web comic"),
-                GenreFilter("webtoon", "Webtoon"),
-                GenreFilter("wuxia", "Wuxia"),
-                GenreFilter("yaoi", "Yaoi"),
-                GenreFilter("yuri", "Yuri"),
-                GenreFilter("zombies", "Zombies")
-            )
-        ),
-        UriFilter {
-        override fun addToUri(uri: Uri.Builder) {
-            val genresParameterValue =
-                state.filter { it.isIncluded() }.joinToString(",") { it.uriParam }
-            if (genresParameterValue.isNotEmpty()) {
-                uri.appendQueryParameter("genres", genresParameterValue)
-            }
-
-            val genresExcludeParameterValue =
-                state.filter { it.isExcluded() }.joinToString(",") { it.uriParam }
-            if (genresExcludeParameterValue.isNotEmpty()) {
-                uri.appendQueryParameter("genres-exclude", genresExcludeParameterValue)
-            }
-        }
-    }
-
-    private class GenreInclusionFilter : UriSelectFilter(
-        "Genre inclusion",
-        "genres-mode",
-        arrayOf(
-            Pair("and", "And mode"),
-            Pair("or", "Or mode")
-        )
-    )
-
-    private class ChapterCountFilter : UriSelectFilter(
-        "Chapter count",
-        "chapters",
-        arrayOf(
-            Pair("any", "Any"),
-            Pair("1", "1 +"),
-            Pair("5", "5 +"),
-            Pair("10", "10 +"),
-            Pair("20", "20 +"),
-            Pair("30", "30 +"),
-            Pair("40", "40 +"),
-            Pair("50", "50 +"),
-            Pair("100", "100 +"),
-            Pair("150", "150 +"),
-            Pair("200", "200 +")
-        )
+    private class GenreFilterBig : UriSelectFilter(
+        displayName = "Genre",
+        uriParam = "genre",
+        items = arrayOf(
+            // TODO: 14/09/2021 update values
+            GenreFilter("all", "All"),
+            GenreFilter("action", "Action"),
+            GenreFilter("adaptation", "Adaptation"),
+            GenreFilter("adult", "Adult"),
+            GenreFilter("adventure", "Adventure"),
+            GenreFilter("aliens", "Aliens"),
+            GenreFilter("animals", "Animals"),
+            GenreFilter("anthology", "Anthology"),
+            GenreFilter("award-winning", "Award winning"),
+            GenreFilter("comedy", "Comedy"),
+            GenreFilter("cooking", "Cooking"),
+            GenreFilter("crime", "Crime"),
+            GenreFilter("crossdressing", "Crossdressing"),
+            GenreFilter("delinquents", "Delinquents"),
+            GenreFilter("demons", "Demons"),
+            GenreFilter("doujinshi", "Doujinshi"),
+            GenreFilter("drama", "Drama"),
+            GenreFilter("ecchi", "Ecchi"),
+            GenreFilter("fan-colored", "Fan colored"),
+            GenreFilter("fantasy", "Fantasy"),
+            GenreFilter("food", "Food"),
+            GenreFilter("full-color", "Full color"),
+            GenreFilter("game", "Game"),
+            GenreFilter("gender-bender", "Gender bender"),
+            GenreFilter("genderswap", "Genderswap"),
+            GenreFilter("ghosts", "Ghosts"),
+            GenreFilter("gore", "Gore"),
+            GenreFilter("gossip", "Gossip"),
+            GenreFilter("gyaru", "Gyaru"),
+            GenreFilter("harem", "Harem"),
+            GenreFilter("historical", "Historical"),
+            GenreFilter("horror", "Horror"),
+            GenreFilter("incest", "Incest"),
+            GenreFilter("isekai", "Isekai"),
+            GenreFilter("josei", "Josei"),
+            GenreFilter("kids", "Kids"),
+            GenreFilter("loli", "Loli"),
+            GenreFilter("lolicon", "Lolicon"),
+            GenreFilter("long-strip", "Long strip"),
+            GenreFilter("mafia", "Mafia"),
+            GenreFilter("magic", "Magic"),
+            GenreFilter("magical-girls", "Magical girls"),
+            GenreFilter("manhwa", "Manhwa"),
+            GenreFilter("martial-arts", "Martial arts"),
+            GenreFilter("mature", "Mature"),
+            GenreFilter("mecha", "Mecha"),
+            GenreFilter("medical", "Medical"),
+            GenreFilter("military", "Military"),
+            GenreFilter("monster-girls", "Monster girls"),
+            GenreFilter("monsters", "Monsters"),
+            GenreFilter("music", "Music"),
+            GenreFilter("mystery", "Mystery"),
+            GenreFilter("ninja", "Ninja"),
+            GenreFilter("office-workers", "Office workers"),
+            GenreFilter("official-colored", "Official colored"),
+            GenreFilter("one-shot", "One shot"),
+            GenreFilter("parody", "Parody"),
+            GenreFilter("philosophical", "Philosophical"),
+            GenreFilter("police", "Police"),
+            GenreFilter("post-apocalyptic", "Post apocalyptic"),
+            GenreFilter("psychological", "Psychological"),
+            GenreFilter("reincarnation", "Reincarnation"),
+            GenreFilter("reverse-harem", "Reverse harem"),
+            GenreFilter("romance", "Romance"),
+            GenreFilter("samurai", "Samurai"),
+            GenreFilter("school-life", "School life"),
+            GenreFilter("sci-fi", "Sci fi"),
+            GenreFilter("seinen", "Seinen"),
+            GenreFilter("shota", "Shota"),
+            GenreFilter("shotacon", "Shotacon"),
+            GenreFilter("shoujo", "Shoujo"),
+            GenreFilter("shoujo-ai", "Shoujo ai"),
+            GenreFilter("shounen", "Shounen"),
+            GenreFilter("shounen-ai", "Shounen ai"),
+            GenreFilter("slice-of-life", "Slice of life"),
+            GenreFilter("smut", "Smut"),
+            GenreFilter("space", "Space"),
+            GenreFilter("sports", "Sports"),
+            GenreFilter("super-power", "Super power"),
+            GenreFilter("superhero", "Superhero"),
+            GenreFilter("supernatural", "Supernatural"),
+            GenreFilter("survival", "Survival"),
+            GenreFilter("suspense", "Suspense"),
+            GenreFilter("thriller", "Thriller"),
+            GenreFilter("time-travel", "Time travel"),
+            GenreFilter("toomics", "Toomics"),
+            GenreFilter("traditional-games", "Traditional games"),
+            GenreFilter("tragedy", "Tragedy"),
+            GenreFilter("user-created", "User created"),
+            GenreFilter("vampire", "Vampire"),
+            GenreFilter("vampires", "Vampires"),
+            GenreFilter("video-games", "Video games"),
+            GenreFilter("virtual-reality", "Virtual reality"),
+            GenreFilter("web-comic", "Web comic"),
+            GenreFilter("webtoon", "Webtoon"),
+            GenreFilter("wuxia", "Wuxia"),
+            GenreFilter("yaoi", "Yaoi"),
+            GenreFilter("yuri", "Yuri"),
+            GenreFilter("zombies", "Zombies")
+        ).map { it.toPair() }.toTypedArray(),
+        firstIsUnspecified = true,
+        defaultValue = 0
     )
 
     private class StatusFilter : UriSelectFilter(
         "Status",
         "status",
         arrayOf(
-            Pair("any", "Any"),
-            Pair("completed", "Completed"),
-            Pair("ongoing", "Ongoing")
-        )
-    )
-
-    private class RatingFilter : UriSelectFilter(
-        "Rating",
-        "rating",
-        arrayOf(
-            Pair("any", "Any"),
-            Pair("5", "5 stars"),
-            Pair("4", "4 stars"),
-            Pair("3", "3 stars"),
-            Pair("2", "2 stars"),
-            Pair("1", "1 star"),
-            Pair("0", "0 stars")
-        )
-    )
-
-    private class TypeFilter : UriSelectFilter(
-        "Type",
-        "types",
-        arrayOf(
-            Pair("any", "Any"),
-            Pair("manga", "Japanese Manga"),
-            Pair("manhwa", "Korean Manhwa"),
-            Pair("manhua", "Chinese Manhua"),
-            Pair("unknown", "Unknown")
-        )
-    )
-
-    private class YearFilter : UriSelectFilter(
-        "Release year",
-        "years",
-        arrayOf(
-            Pair("any", "Any"),
-            // Get all years between today and 1946
-            *(Calendar.getInstance().get(Calendar.YEAR) downTo 1946).map {
-                Pair(it.toString(), it.toString())
-            }.toTypedArray()
-        )
+            Pair("all", "All"),
+            Pair("ongoing", "Ongoing"),
+            Pair("completed", "Completed")
+        ),
+        firstIsUnspecified = true,
+        defaultValue = 0
     )
 
     private class SortFilter : UriSelectFilter(
         "Sort",
-        "orderby",
+        "sort",
         arrayOf(
-            Pair("a-z", "A-Z"),
-            Pair("views_a", "Views all-time"),
-            Pair("views_y", "Views last 365 days"),
-            Pair("views_s", "Views last 180 days"),
-            Pair("views_t", "Views last 90 days"),
+            Pair("views", "Most Views"),
+            Pair("updated_at", "Recently updated"),
+            Pair("created_at", "Recently added"),
+            Pair("name", "A-Z"),
             Pair("rating", "Rating"),
-            Pair("update", "Latest"),
-            Pair("create", "New manga")
+            Pair("votes", "Votes")
         ),
-        firstIsUnspecified = false,
-        defaultValue = 1
+        firstIsUnspecified = true,
+        defaultValue = 0
     )
 
     /**
@@ -494,19 +405,19 @@ class MangaMad : ParsedHttpSource() {
      * If an entry is selected it is appended as a query parameter onto the end of the URI.
      * If `firstIsUnspecified` is set to true, if the first entry is selected, nothing will be appended on the the URI.
      */
-    // vals: <name, display>
     private open class UriSelectFilter(
         displayName: String,
         val uriParam: String,
-        val vals: Array<Pair<String, String>>,
+        val items: Array<Pair<String, String>>,
         val firstIsUnspecified: Boolean = true,
         defaultValue: Int = 0
     ) :
-        Filter.Select<String>(displayName, vals.map { it.second }.toTypedArray(), defaultValue),
+        Filter.Select<String>(displayName, items.map { it.second }.toTypedArray(), defaultValue),
         UriFilter {
         override fun addToUri(uri: Uri.Builder) {
-            if (state != 0 || !firstIsUnspecified)
-                uri.appendQueryParameter(uriParam, vals[state].first)
+            if (state != 0 || !firstIsUnspecified) {
+                uri.appendQueryParameter(uriParam, items[state].first)
+            }
         }
     }
 
@@ -515,28 +426,5 @@ class MangaMad : ParsedHttpSource() {
      */
     private interface UriFilter {
         fun addToUri(uri: Uri.Builder)
-    }
-
-    // Preferences
-
-    private val preferences: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
-    }
-
-    private fun getSourcePref(): String? = preferences.getString(SOURCE_PREF, "all")
-
-    companion object {
-        private const val SOURCE_PREF_TITLE = "Chapter List Source"
-        private const val SOURCE_PREF = "Manga_Park_Source"
-        private val sourceArray = arrayOf(
-            Pair("All sources, all chapters", "all"),
-            Pair("Source with most chapters", "most"),
-            Pair("Smart list", "smart"),
-            Pair("Prioritize source: Rock", "rock"),
-            Pair("Prioritize source: Duck", "duck"),
-            Pair("Prioritize source: Mini", "mini"),
-            Pair("Prioritize source: Fox", "fox"),
-            Pair("Prioritize source: Panda", "panda")
-        )
     }
 }
