@@ -11,13 +11,11 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import kotlinx.serialization.json.Json
 import okhttp3.CacheControl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -162,9 +160,9 @@ class MangaMad : ParsedHttpSource() {
             ?.getOrNull(1)
             ?.toFloatOrNull()
             ?: Regex("""chapter.*?(\d+-?\d?)""").find(name.toLowerCase())
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toFloatOrNull() ?: 0f
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toFloatOrNull() ?: 0f
         date_upload = parseDate(element.selectFirst(".chapter-update").text().trim())
     }
 
@@ -250,13 +248,6 @@ class MangaMad : ParsedHttpSource() {
         GenreFilterBig(),
         StatusFilter(),
     )
-
-    private class SearchTypeFilter(name: String, val uriParam: String) :
-        Filter.Text(name), UriFilter {
-        override fun addToUri(uri: Uri.Builder) {
-            uri.appendQueryParameter(uriParam, state)
-        }
-    }
 
     private data class GenreFilter(val uriParam: String, val displayName: String) {
         fun toPair(): Pair<String, String> {
