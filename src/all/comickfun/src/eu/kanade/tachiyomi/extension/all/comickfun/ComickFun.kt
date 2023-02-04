@@ -22,6 +22,7 @@ import rx.Observable
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.TimeZone
 
 const val API_BASE = "https://api.comick.fun"
 
@@ -262,20 +263,18 @@ abstract class ComickFun(override val lang: String, private val comickFunLang: S
             SChapter.create().apply {
                 url = "/comic/${mangaData.comic.slug}/${chapter.hid}-chapter-${chapter.chap}-$comickFunLang"
                 name = beautifyChapterName(chapter.vol, chapter.chap, chapter.title)
-                date_upload = chapter.created_at.let {
-                    try {
-                        DATE_FORMATTER.parse(it)?.time ?: 0L
-                    } catch (e: ParseException) {
-                        0L
-                    }
-                }
+                date_upload = runCatching {
+                    DATE_FORMATTER.parse(chapter.created_at)?.time
+                }.getOrNull() ?: 0L
                 scanlator = chapter.group_name.joinToString().takeUnless { it.isBlank() }
             }
         }
     }
 
     private val DATE_FORMATTER by lazy {
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ENGLISH)
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ENGLISH).apply {
+            timeZone = TimeZone.getTimeZone("GMT+0:00")
+        }
     }
 
     /** Chapter Pages **/
